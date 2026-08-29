@@ -1,12 +1,9 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
 import test from 'node:test';
 import { io as createClient } from 'socket.io-client';
 import { createApplication } from '../src/app.js';
-import { RoomStore } from '../src/store.js';
+import { TestRoomStore } from './testStore.js';
 
 function once(socket, event) {
   return new Promise((resolve, reject) => {
@@ -18,9 +15,8 @@ function once(socket, event) {
   });
 }
 
-test('two clients create, join, synchronize text, and close the room', async (context) => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'noted-integration-'));
-  const store = new RoomStore(path.join(directory, 'rooms.json'));
+test('two clients create, join, send a message, and close the room', async (context) => {
+  const store = new TestRoomStore();
   await store.init();
   const { app, attachSockets } = createApplication({ store });
   const server = createServer(app);
@@ -42,15 +38,15 @@ test('two clients create, join, synchronize text, and close the room', async (co
   context.after(() => { first.disconnect(); second.disconnect(); });
   await Promise.all([once(first, 'connect'), once(second, 'connect')]);
 
-  const receivedUpdate = once(second, 'content:updated');
+  const receivedUpdate = once(second, 'message:new');
   const acknowledgement = new Promise((resolve) => {
-    first.emit('content:update', { content: 'same text on both phones' }, resolve);
+    first.emit('message:send', { text: 'sent only after pressing send' }, resolve);
   });
   assert.equal((await acknowledgement).ok, true);
-  assert.equal((await receivedUpdate).content, 'same text on both phones');
+  assert.equal((await receivedUpdate).text, 'sent only after pressing send');
 
   const closed = once(second, 'session:closed');
   first.emit('session:logout', {}, () => undefined);
   await closed;
-  assert.throws(() => store.requireParticipant(joiner.token), /no longer active/);
+  await assert.rejects(() => store.requireParticipant(joiner.token), /no longer active/);
 });

@@ -1,112 +1,113 @@
-import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { MongoClient } from 'mongodb';
 
-const EMPTY_DATABASE = { rooms: [] };
+const MESSAGE_LIMIT = 100;
+
+function httpError(message, status) {
+  return Object.assign(new Error(message), { status });
+}
 
 function hashToken(token) {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function safeHashEquals(candidate, expectedHash) {
-  const actual = Buffer.from(hashToken(candidate), 'hex');
-  const expected = Buffer.from(expectedHash, 'hex');
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
+function iso(value) {
+  return value instanceof Date ? value.toISOString() : value;
 }
 
-export class RoomStore {
-  constructor(filePath) {
-    this.filePath = path.resolve(filePath);
-    this.database = structuredClone(EMPTY_DATABASE);
-    this.writeQueue = Promise.resolve();
+export class MongoRoomStore {
+  constructor(uri, databaseName = 'noted') {
+    if (!uri) throw new Error('MONGODB_URI is required.');
+    this.client = new MongoClient(uri);
+    this.databaseName = databaseName;
   }
 
   async init() {
-    await mkdir(path.dirname(this.filePath), { recursive: true });
-    try {
-      this.database = JSON.parse(await readFile(this.filePath, 'utf8'));
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      await this.persist();
-    }
+    await this.client.connect();
+    this.database = this.client.db(this.databaseName);
+    this.rooms = this.database.collection('rooms');
+    this.messages = this.database.collection('messages');
+    await Promise.all([
+      this.rooms.createIndex({ code: 1 }, { unique: true }),
+      this.rooms.createIndex({ 'participants.tokenHash': 1 }),
+      this.messages.createIndex({ roomId: 1, createdAt: -1 }),
+    ]);
+    await this.rooms.updateMany(
+      { active: true },
+      { $set: { 'participants.$[].foreground': false } },
+    );
   }
 
-  async persist() {
-    const snapshot = JSON.stringify(this.database, null, 2);
-    const temporaryPath = `${this.filePath}.tmp`;
-    this.writeQueue = this.writeQueue.then(async () => {
-      await writeFile(temporaryPath, snapshot, 'utf8');
-      await rename(temporaryPath, this.filePath);
-    });
-    return this.writeQueue;
+  async close() {
+    await this.client.close();
   }
 
-  activeRoomByCode(code) {
-    return this.database.rooms.find((room) => room.code === code && room.active);
+  async health() {
+    await this.database.command({ ping: 1 });
   }
 
-  participantByToken(token) {
-    if (!token) return null;
-    for (const room of this.database.rooms) {
-      const participant = room.participants.find((item) => safeHashEquals(token, item.tokenHash));
-      if (participant) return { room, participant };
-    }
-    return null;
+  async messagesForRoom(roomId) {
+    const messages = await this.messages
+      .find({ roomId })
+      .sort({ createdAt: -1 })
+      .limit(MESSAGE_LIMIT)
+      .toArray();
+    return messages.reverse().map((message) => ({
+      id: message._id,
+      text: message.text,
+      authorId: message.authorId,
+      createdAt: iso(message.createdAt),
+    }));
   }
 
-  publicRoom(room, participantId) {
+  async publicRoom(room, participantId) {
     return {
-      id: room.id,
+      id: room._id,
       code: room.code,
       active: room.active,
-      content: room.content,
-      version: room.version,
-      createdAt: room.createdAt,
-      updatedAt: room.updatedAt,
+      createdAt: iso(room.createdAt),
+      updatedAt: iso(room.updatedAt),
       participantId,
       participantCount: room.participants.length,
       peerConnected: room.participants.some(
         (participant) => participant.id !== participantId && participant.foreground,
       ),
+      messages: await this.messagesForRoom(room._id),
     };
   }
 
   async createRoom() {
-    let code;
-    do code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-    while (this.activeRoomByCode(code));
-
-    const token = randomBytes(32).toString('base64url');
-    const now = new Date().toISOString();
-    const participant = {
-      id: randomUUID(),
-      tokenHash: hashToken(token),
-      pushToken: null,
-      foreground: false,
-      joinedAt: now,
-    };
-    const room = {
-      id: randomUUID(),
-      code,
-      active: true,
-      content: '',
-      version: 0,
-      createdAt: now,
-      updatedAt: now,
-      participants: [participant],
-    };
-    this.database.rooms.push(room);
-    await this.persist();
-    return { room: this.publicRoom(room, participant.id), token };
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const token = randomBytes(32).toString('base64url');
+      const now = new Date();
+      const participant = {
+        id: randomUUID(),
+        tokenHash: hashToken(token),
+        pushToken: null,
+        foreground: false,
+        joinedAt: now,
+      };
+      const room = {
+        _id: randomUUID(),
+        code: String(randomInt(0, 1_000_000)).padStart(6, '0'),
+        active: true,
+        createdAt: now,
+        updatedAt: now,
+        participants: [participant],
+      };
+      try {
+        await this.rooms.insertOne(room);
+        return { room: await this.publicRoom(room, participant.id), token };
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+      }
+    }
+    throw new Error('Could not allocate a unique room code.');
   }
 
   async joinRoom(rawCode) {
     const code = String(rawCode ?? '').replace(/\D/g, '');
-    const room = this.activeRoomByCode(code);
-    if (!room) throw Object.assign(new Error('Room code was not found.'), { status: 404 });
-    if (room.participants.length >= 2) {
-      throw Object.assign(new Error('This room already has two people.'), { status: 409 });
-    }
+    if (code.length !== 6) throw httpError('Enter a valid 6-digit room code.', 400);
 
     const token = randomBytes(32).toString('base64url');
     const participant = {
@@ -114,54 +115,80 @@ export class RoomStore {
       tokenHash: hashToken(token),
       pushToken: null,
       foreground: false,
-      joinedAt: new Date().toISOString(),
+      joinedAt: new Date(),
     };
-    room.participants.push(participant);
-    room.updatedAt = new Date().toISOString();
-    await this.persist();
-    return { room: this.publicRoom(room, participant.id), token };
+    const result = await this.rooms.findOneAndUpdate(
+      { code, active: true, 'participants.1': { $exists: false } },
+      { $push: { participants: participant }, $set: { updatedAt: new Date() } },
+      { returnDocument: 'after' },
+    );
+    if (!result) {
+      const existing = await this.rooms.findOne({ code, active: true });
+      if (existing) throw httpError('This room already has two people.', 409);
+      throw httpError('Room code was not found.', 404);
+    }
+    return { room: await this.publicRoom(result, participant.id), token };
   }
 
-  requireParticipant(token, { allowInactive = false } = {}) {
-    const result = this.participantByToken(token);
-    if (!result || (!allowInactive && !result.room.active)) {
-      throw Object.assign(new Error('Your session is no longer active.'), { status: 401 });
-    }
-    return result;
+  async requireParticipant(token) {
+    if (!token) throw httpError('Your session is no longer active.', 401);
+    const tokenHash = hashToken(token);
+    const room = await this.rooms.findOne({ active: true, 'participants.tokenHash': tokenHash });
+    if (!room) throw httpError('Your session is no longer active.', 401);
+    const participant = room.participants.find((item) => item.tokenHash === tokenHash);
+    return { room, participant, tokenHash };
   }
 
-  async updateContent(token, content) {
-    const { room, participant } = this.requireParticipant(token);
-    if (typeof content !== 'string' || content.length > 4000) {
-      throw Object.assign(new Error('Text must contain at most 4,000 characters.'), { status: 400 });
-    }
-    room.content = content;
-    room.version += 1;
-    room.updatedAt = new Date().toISOString();
-    await this.persist();
-    return { room, participant, publicRoom: this.publicRoom(room, participant.id) };
+  async sendMessage(token, rawText) {
+    const text = typeof rawText === 'string' ? rawText.trim() : '';
+    if (!text) throw httpError('Write a message before sending.', 400);
+    if (text.length > 4000) throw httpError('Messages must contain at most 4,000 characters.', 400);
+
+    const { room, participant } = await this.requireParticipant(token);
+    const now = new Date();
+    const message = { _id: randomUUID(), roomId: room._id, authorId: participant.id, text, createdAt: now };
+    const updated = await this.rooms.updateOne(
+      { _id: room._id, active: true },
+      { $set: { updatedAt: now } },
+    );
+    if (!updated.matchedCount) throw httpError('Your session is no longer active.', 401);
+    await this.messages.insertOne(message);
+    return {
+      room: { ...room, updatedAt: now },
+      participant,
+      message: { id: message._id, text, authorId: participant.id, createdAt: now.toISOString() },
+    };
   }
 
   async setPushToken(token, pushToken) {
-    const { participant } = this.requireParticipant(token);
-    participant.pushToken = typeof pushToken === 'string' ? pushToken : null;
-    await this.persist();
+    const { room, participant, tokenHash } = await this.requireParticipant(token);
+    const value = typeof pushToken === 'string' ? pushToken : null;
+    await this.rooms.updateOne(
+      { _id: room._id, 'participants.tokenHash': tokenHash },
+      { $set: { 'participants.$.pushToken': value } },
+    );
+    participant.pushToken = value;
   }
 
   async setForeground(token, foreground) {
-    const result = this.participantByToken(token);
-    if (!result || !result.room.active) return;
-    result.participant.foreground = Boolean(foreground);
-    await this.persist();
+    if (!token) return;
+    const tokenHash = hashToken(token);
+    await this.rooms.updateOne(
+      { active: true, 'participants.tokenHash': tokenHash },
+      { $set: { 'participants.$.foreground': Boolean(foreground) } },
+    );
   }
 
   async logout(token) {
-    const { room } = this.requireParticipant(token);
-    room.active = false;
-    room.updatedAt = new Date().toISOString();
-    for (const participant of room.participants) participant.foreground = false;
-    await this.persist();
-    return room;
+    const { room } = await this.requireParticipant(token);
+    const updatedAt = new Date();
+    const result = await this.rooms.findOneAndUpdate(
+      { _id: room._id, active: true },
+      { $set: { active: false, updatedAt, 'participants.$[].foreground': false } },
+      { returnDocument: 'after' },
+    );
+    if (!result) throw httpError('Your session is no longer active.', 401);
+    return result;
   }
 }
 

@@ -14,7 +14,16 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
   app.use(cors({ origin: corsOrigin === '*' ? true : corsOrigin.split(',') }));
   app.use(express.json({ limit: '32kb' }));
 
-  app.get('/health', (_request, response) => response.json({ ok: true }));
+  app.get('/', (_request, response) => response.json({ name: 'Noted API', ok: true }));
+
+  app.get('/health', async (_request, response, next) => {
+    try {
+      await store.health?.();
+      response.json({ ok: true });
+    } catch (error) {
+      next(error);
+    }
+  });
 
   app.post('/api/rooms', async (_request, response, next) => {
     try {
@@ -32,10 +41,10 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
     }
   });
 
-  app.get('/api/session', (request, response, next) => {
+  app.get('/api/session', async (request, response, next) => {
     try {
-      const { room, participant } = store.requireParticipant(bearerToken(request));
-      response.json({ room: store.publicRoom(room, participant.id) });
+      const { room, participant } = await store.requireParticipant(bearerToken(request));
+      response.json({ room: await store.publicRoom(room, participant.id) });
     } catch (error) {
       next(error);
     }
@@ -57,9 +66,10 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
   app.delete('/api/session', async (request, response, next) => {
     try {
       const room = await store.logout(bearerToken(request));
-      io?.to(room.id).emit('session:closed');
-      io?.in(room.id).disconnectSockets(true);
-      response.json({ roomId: room.id });
+      const roomId = room._id ?? room.id;
+      io?.to(roomId).emit('session:closed');
+      io?.in(roomId).disconnectSockets(true);
+      response.json({ roomId });
     } catch (error) {
       next(error);
     }
@@ -76,38 +86,30 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
     });
 
     io.use((socket, next) => {
-      try {
-        const token = String(socket.handshake.auth?.token ?? '');
-        const result = store.requireParticipant(token);
+      const token = String(socket.handshake.auth?.token ?? '');
+      store.requireParticipant(token).then((result) => {
         socket.data.token = token;
         socket.data.participantId = result.participant.id;
-        socket.data.roomId = result.room.id;
+        socket.data.roomId = result.room._id ?? result.room.id;
         next();
-      } catch (error) {
-        next(new Error('unauthorized'));
-      }
+      }).catch(() => next(new Error('unauthorized')));
     });
 
     io.on('connection', async (socket) => {
       socket.join(socket.data.roomId);
-      const { room, participant } = store.requireParticipant(socket.data.token);
-      socket.emit('room:state', store.publicRoom(room, participant.id));
-      io.to(room.id).emit('room:presence', { participantCount: room.participants.length });
+      const { room, participant } = await store.requireParticipant(socket.data.token);
+      socket.emit('room:state', await store.publicRoom(room, participant.id));
+      io.to(socket.data.roomId).emit('room:presence', { participantCount: room.participants.length });
 
       socket.on('presence:set', async ({ foreground } = {}) => {
         await store.setForeground(socket.data.token, foreground);
       });
 
-      socket.on('content:update', async ({ content } = {}, acknowledge = () => {}) => {
+      socket.on('message:send', async ({ text } = {}, acknowledge = () => {}) => {
         try {
-          const result = await store.updateContent(socket.data.token, content);
-          io.to(result.room.id).emit('content:updated', {
-            content: result.room.content,
-            version: result.room.version,
-            updatedAt: result.room.updatedAt,
-            authorId: result.participant.id,
-          });
-          acknowledge({ ok: true, version: result.room.version });
+          const result = await store.sendMessage(socket.data.token, text);
+          io.to(socket.data.roomId).emit('message:new', result.message);
+          acknowledge({ ok: true, message: result.message });
 
           const recipients = result.room.participants.filter(
             (item) => item.id !== result.participant.id && !item.foreground,
@@ -115,7 +117,7 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
           pushRoomUpdate({
             recipients,
             roomCode: result.room.code,
-            content: result.room.content,
+            text: result.message.text,
             accessToken: expoAccessToken,
           }).catch((error) => console.error('Push delivery failed:', error.message));
         } catch (error) {
@@ -126,15 +128,17 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
       socket.on('session:logout', async (_payload, acknowledge = () => {}) => {
         try {
           const closedRoom = await store.logout(socket.data.token);
-          io.to(closedRoom.id).emit('session:closed');
+          io.to(closedRoom._id ?? closedRoom.id).emit('session:closed');
           acknowledge({ ok: true });
-          io.in(closedRoom.id).disconnectSockets(true);
+          io.in(closedRoom._id ?? closedRoom.id).disconnectSockets(true);
         } catch (error) {
           acknowledge({ ok: false, error: error.message });
         }
       });
 
-      socket.on('disconnect', () => store.setForeground(socket.data.token, false));
+      socket.on('disconnect', () => {
+        store.setForeground(socket.data.token, false).catch(() => undefined);
+      });
     });
     return io;
   }

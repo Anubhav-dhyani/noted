@@ -4,11 +4,11 @@ export function isExpoPushToken(value) {
   return typeof value === 'string' && /^(ExponentPushToken|ExpoPushToken)\[[^\]]+\]$/.test(value);
 }
 
-export async function pushRoomUpdate({ recipients, roomCode, content, accessToken }) {
+export async function pushRoomUpdate({ recipients, roomCode, text, accessToken }) {
   const tokens = recipients.map((participant) => participant.pushToken).filter(isExpoPushToken);
   if (tokens.length === 0) return [];
 
-  const preview = content.trim() || 'The shared note was cleared.';
+  const preview = text.trim();
   const messages = tokens.flatMap((to) => [
     {
       to,

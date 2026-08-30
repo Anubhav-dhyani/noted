@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { MongoClient } from 'mongodb';
 
 const MESSAGE_LIMIT = 100;
+const REPLY_PREVIEW_LIMIT = 280;
 
 function httpError(message, status) {
   return Object.assign(new Error(message), { status });
@@ -13,6 +14,16 @@ function hashToken(token) {
 
 function iso(value) {
   return value instanceof Date ? value.toISOString() : value;
+}
+
+function publicMessage(message) {
+  return {
+    id: message._id,
+    text: message.text,
+    authorId: message.authorId,
+    createdAt: iso(message.createdAt),
+    ...(message.replyTo ? { replyTo: message.replyTo } : {}),
+  };
 }
 
 export class MongoRoomStore {
@@ -52,12 +63,7 @@ export class MongoRoomStore {
       .sort({ createdAt: -1 })
       .limit(MESSAGE_LIMIT)
       .toArray();
-    return messages.reverse().map((message) => ({
-      id: message._id,
-      text: message.text,
-      authorId: message.authorId,
-      createdAt: iso(message.createdAt),
-    }));
+    return messages.reverse().map(publicMessage);
   }
 
   async publicRoom(room, participantId) {
@@ -139,14 +145,28 @@ export class MongoRoomStore {
     return { room, participant, tokenHash };
   }
 
-  async sendMessage(token, rawText) {
+  async sendMessage(token, rawText, rawReplyToId) {
     const text = typeof rawText === 'string' ? rawText.trim() : '';
     if (!text) throw httpError('Write a message before sending.', 400);
     if (text.length > 4000) throw httpError('Messages must contain at most 4,000 characters.', 400);
 
     const { room, participant } = await this.requireParticipant(token);
+    let replyTo;
+    if (rawReplyToId !== undefined && rawReplyToId !== null && rawReplyToId !== '') {
+      if (typeof rawReplyToId !== 'string') throw httpError('The replied message is invalid.', 400);
+      const original = await this.messages.findOne({ _id: rawReplyToId, roomId: room._id });
+      if (!original) throw httpError('The message you replied to is no longer available.', 400);
+      replyTo = {
+        id: original._id,
+        text: original.text.slice(0, REPLY_PREVIEW_LIMIT),
+        authorId: original.authorId,
+      };
+    }
     const now = new Date();
-    const message = { _id: randomUUID(), roomId: room._id, authorId: participant.id, text, createdAt: now };
+    const message = {
+      _id: randomUUID(), roomId: room._id, authorId: participant.id, text, createdAt: now,
+      ...(replyTo ? { replyTo } : {}),
+    };
     const updated = await this.rooms.updateOne(
       { _id: room._id, active: true },
       { $set: { updatedAt: now } },
@@ -156,7 +176,7 @@ export class MongoRoomStore {
     return {
       room: { ...room, updatedAt: now },
       participant,
-      message: { id: message._id, text, authorId: participant.id, createdAt: now.toISOString() },
+      message: publicMessage(message),
     };
   }
 

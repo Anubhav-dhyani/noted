@@ -23,6 +23,17 @@ test('creates, joins, restores, sends messages, and closes a room', async () => 
   const restored = await store.requireParticipant(joiner.token);
   assert.equal(restored.room.messages[0].text, 'hello from creator');
 
+  const reply = await store.sendMessage(joiner.token, 'hello back', sent.message.id);
+  assert.deepEqual(reply.message.replyTo, {
+    id: sent.message.id,
+    text: 'hello from creator',
+    authorId: sent.message.authorId,
+  });
+  await assert.rejects(
+    () => store.sendMessage(joiner.token, 'bad reply', 'missing-message'),
+    /no longer available/,
+  );
+
   await assert.rejects(() => store.joinRoom(creator.room.code), /already has two people/);
   await store.logout(joiner.token);
   await assert.rejects(() => store.requireParticipant(creator.token), /no longer active/);

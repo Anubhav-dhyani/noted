@@ -105,9 +105,9 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
         await store.setForeground(socket.data.token, foreground);
       });
 
-      socket.on('message:send', async ({ text } = {}, acknowledge = () => {}) => {
+      socket.on('message:send', async ({ text, replyToId } = {}, acknowledge = () => {}) => {
         try {
-          const result = await store.sendMessage(socket.data.token, text);
+          const result = await store.sendMessage(socket.data.token, text, replyToId);
           io.to(socket.data.roomId).emit('message:new', result.message);
           acknowledge({ ok: true, message: result.message });
 
@@ -118,6 +118,7 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
             recipients,
             roomCode: result.room.code,
             text: result.message.text,
+            replyText: result.message.replyTo?.text,
             accessToken: expoAccessToken,
           }).catch((error) => console.error('Push delivery failed:', error.message));
         } catch (error) {

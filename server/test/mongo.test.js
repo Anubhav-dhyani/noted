@@ -19,6 +19,14 @@ test('MongoDB persists rooms, sessions, and message history', { skip: !uri }, as
     const publicRoom = await store.publicRoom(restored.room, restored.participant.id);
     assert.equal(publicRoom.messages[0].text, 'persisted in MongoDB');
 
+    await store.sendMessage(joiner.token, 'persistent reply', sent.message.id);
+    const roomWithReply = await store.publicRoom(restored.room, restored.participant.id);
+    assert.deepEqual(roomWithReply.messages[1].replyTo, {
+      id: sent.message.id,
+      text: sent.message.text,
+      authorId: sent.message.authorId,
+    });
+
     await store.logout(joiner.token);
     await assert.rejects(() => store.requireParticipant(creator.token), /no longer active/);
   } finally {

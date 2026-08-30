@@ -43,7 +43,19 @@ test('two clients create, join, send a message, and close the room', async (cont
     first.emit('message:send', { text: 'sent only after pressing send' }, resolve);
   });
   assert.equal((await acknowledgement).ok, true);
-  assert.equal((await receivedUpdate).text, 'sent only after pressing send');
+  const original = await receivedUpdate;
+  assert.equal(original.text, 'sent only after pressing send');
+
+  const receivedReply = once(first, 'message:new');
+  const replyAcknowledgement = new Promise((resolve) => {
+    second.emit('message:send', { text: 'this is a reply', replyToId: original.id }, resolve);
+  });
+  assert.equal((await replyAcknowledgement).ok, true);
+  assert.deepEqual((await receivedReply).replyTo, {
+    id: original.id,
+    text: original.text,
+    authorId: original.authorId,
+  });
 
   const closed = once(second, 'session:closed');
   first.emit('session:logout', {}, () => undefined);

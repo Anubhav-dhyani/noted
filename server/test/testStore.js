@@ -57,12 +57,17 @@ export class TestRoomStore {
     throw httpError('Your session is no longer active.', 401);
   }
 
-  async sendMessage(token, rawText) {
+  async sendMessage(token, rawText, replyToId) {
     const text = typeof rawText === 'string' ? rawText.trim() : '';
     if (!text) throw httpError('Write a message before sending.', 400);
     if (text.length > 4000) throw httpError('Messages must contain at most 4,000 characters.', 400);
     const { room, participant } = await this.requireParticipant(token);
-    const message = { id: randomUUID(), text, authorId: participant.id, createdAt: new Date().toISOString() };
+    const original = replyToId ? room.messages.find((item) => item.id === replyToId) : null;
+    if (replyToId && !original) throw httpError('The message you replied to is no longer available.', 400);
+    const message = {
+      id: randomUUID(), text, authorId: participant.id, createdAt: new Date().toISOString(),
+      ...(original ? { replyTo: { id: original.id, text: original.text.slice(0, 280), authorId: original.authorId } } : {}),
+    };
     room.messages.push(message);
     room.updatedAt = message.createdAt;
     return { room, participant, message };

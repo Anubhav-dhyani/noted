@@ -10,7 +10,7 @@ test('MongoDB persists rooms, sessions, and message history', { skip: !uri }, as
   const store = new MongoRoomStore(uri, databaseName);
   await store.init();
   try {
-    const creator = await store.createRoom();
+    const creator = await store.createRoom('Mongo Room');
     const joiner = await store.joinRoom(creator.room.code);
     const sent = await store.sendMessage(creator.token, 'persisted in MongoDB');
     assert.equal(sent.message.text, 'persisted in MongoDB');

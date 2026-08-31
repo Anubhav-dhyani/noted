@@ -16,14 +16,34 @@ function iso(value) {
   return value instanceof Date ? value.toISOString() : value;
 }
 
-function publicMessage(message) {
+function messageStatus(message, participantId) {
+  if (message.authorId !== participantId) return undefined;
+  const seenBy = message.seenBy ?? [];
+  const deliveredTo = message.deliveredTo ?? [];
+  if (seenBy.some((id) => id !== participantId)) return 'seen';
+  if (deliveredTo.some((id) => id !== participantId)) return 'delivered';
+  return 'sent';
+}
+
+function publicMessage(message, participantId) {
+  const status = messageStatus(message, participantId);
   return {
     id: message._id,
     text: message.text,
     authorId: message.authorId,
     createdAt: iso(message.createdAt),
     ...(message.replyTo ? { replyTo: message.replyTo } : {}),
+    ...(message.clientId ? { clientId: message.clientId } : {}),
+    ...(status ? { status } : {}),
   };
+}
+
+function sessionName(value) {
+  if (value === undefined) return 'Private session';
+  const name = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+  if (!name) throw httpError('Enter a name for the session.', 400);
+  if (name.length > 50) throw httpError('Session names must contain at most 50 characters.', 400);
+  return name;
 }
 
 export class MongoRoomStore {
@@ -42,6 +62,10 @@ export class MongoRoomStore {
       this.rooms.createIndex({ code: 1 }, { unique: true }),
       this.rooms.createIndex({ 'participants.tokenHash': 1 }),
       this.messages.createIndex({ roomId: 1, createdAt: -1 }),
+      this.messages.createIndex(
+        { roomId: 1, authorId: 1, clientId: 1 },
+        { unique: true, partialFilterExpression: { clientId: { $type: 'string' } } },
+      ),
     ]);
     await this.rooms.updateMany(
       { active: true },
@@ -57,18 +81,19 @@ export class MongoRoomStore {
     await this.database.command({ ping: 1 });
   }
 
-  async messagesForRoom(roomId) {
+  async messagesForRoom(roomId, participantId) {
     const messages = await this.messages
       .find({ roomId })
       .sort({ createdAt: -1 })
       .limit(MESSAGE_LIMIT)
       .toArray();
-    return messages.reverse().map(publicMessage);
+    return messages.reverse().map((message) => publicMessage(message, participantId));
   }
 
   async publicRoom(room, participantId) {
     return {
       id: room._id,
+      name: room.name ?? 'Private session',
       code: room.code,
       active: room.active,
       createdAt: iso(room.createdAt),
@@ -78,11 +103,17 @@ export class MongoRoomStore {
       peerConnected: room.participants.some(
         (participant) => participant.id !== participantId && participant.foreground,
       ),
-      messages: await this.messagesForRoom(room._id),
+      messages: await this.messagesForRoom(room._id, participantId),
+      unreadCount: await this.messages.countDocuments({
+        roomId: room._id,
+        authorId: { $ne: participantId },
+        seenBy: { $ne: participantId },
+      }),
     };
   }
 
-  async createRoom() {
+  async createRoom(rawName) {
+    const name = sessionName(rawName);
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const token = randomBytes(32).toString('base64url');
       const now = new Date();
@@ -95,6 +126,7 @@ export class MongoRoomStore {
       };
       const room = {
         _id: randomUUID(),
+        name,
         code: String(randomInt(0, 1_000_000)).padStart(6, '0'),
         active: true,
         createdAt: now,
@@ -145,12 +177,21 @@ export class MongoRoomStore {
     return { room, participant, tokenHash };
   }
 
-  async sendMessage(token, rawText, rawReplyToId) {
+  async sendMessage(token, rawText, rawReplyToId, rawClientId) {
     const text = typeof rawText === 'string' ? rawText.trim() : '';
     if (!text) throw httpError('Write a message before sending.', 400);
     if (text.length > 4000) throw httpError('Messages must contain at most 4,000 characters.', 400);
 
     const { room, participant } = await this.requireParticipant(token);
+    const clientId = typeof rawClientId === 'string' && rawClientId.length <= 100 ? rawClientId : undefined;
+    if (clientId) {
+      const existing = await this.messages.findOne({
+        roomId: room._id,
+        authorId: participant.id,
+        clientId,
+      });
+      if (existing) return { room, participant, message: publicMessage(existing, participant.id) };
+    }
     let replyTo;
     if (rawReplyToId !== undefined && rawReplyToId !== null && rawReplyToId !== '') {
       if (typeof rawReplyToId !== 'string') throw httpError('The replied message is invalid.', 400);
@@ -165,19 +206,68 @@ export class MongoRoomStore {
     const now = new Date();
     const message = {
       _id: randomUUID(), roomId: room._id, authorId: participant.id, text, createdAt: now,
+      deliveredTo: [], seenBy: [],
       ...(replyTo ? { replyTo } : {}),
+      ...(clientId ? { clientId } : {}),
     };
     const updated = await this.rooms.updateOne(
       { _id: room._id, active: true },
       { $set: { updatedAt: now } },
     );
     if (!updated.matchedCount) throw httpError('Your session is no longer active.', 401);
-    await this.messages.insertOne(message);
+    try {
+      await this.messages.insertOne(message);
+    } catch (error) {
+      if (error?.code !== 11000 || !clientId) throw error;
+      const existing = await this.messages.findOne({ roomId: room._id, authorId: participant.id, clientId });
+      if (!existing) throw error;
+      return { room: { ...room, updatedAt: now }, participant, message: publicMessage(existing, participant.id) };
+    }
     return {
       room: { ...room, updatedAt: now },
       participant,
-      message: publicMessage(message),
+      message: publicMessage(message, participant.id),
     };
+  }
+
+  async markDelivered(token, messageId) {
+    const { room, participant } = await this.requireParticipant(token);
+    const query = {
+      roomId: room._id,
+      authorId: { $ne: participant.id },
+      deliveredTo: { $ne: participant.id },
+      ...(messageId ? { _id: messageId } : {}),
+    };
+    const pending = await this.messages.find(query, { projection: { _id: 1 } }).toArray();
+    if (pending.length) {
+      await this.messages.updateMany(
+        { _id: { $in: pending.map((message) => message._id) } },
+        { $addToSet: { deliveredTo: participant.id } },
+      );
+    }
+    return { room, participant, messageIds: pending.map((message) => message._id) };
+  }
+
+  async markSeen(token) {
+    const { room, participant } = await this.requireParticipant(token);
+    const query = {
+      roomId: room._id,
+      authorId: { $ne: participant.id },
+      seenBy: { $ne: participant.id },
+    };
+    const pending = await this.messages.find(query, { projection: { _id: 1 } }).toArray();
+    if (pending.length) {
+      await this.messages.updateMany(
+        { _id: { $in: pending.map((message) => message._id) } },
+        {
+          $addToSet: {
+            deliveredTo: participant.id,
+            seenBy: participant.id,
+          },
+        },
+      );
+    }
+    return { room, participant, messageIds: pending.map((message) => message._id) };
   }
 
   async setPushToken(token, pushToken) {

@@ -4,7 +4,7 @@ export function isExpoPushToken(value) {
   return typeof value === 'string' && /^(ExponentPushToken|ExpoPushToken)\[[^\]]+\]$/.test(value);
 }
 
-export async function pushRoomUpdate({ recipients, roomCode, text, replyText, accessToken }) {
+export async function pushRoomUpdate({ recipients, roomCode, roomId, roomName, text, replyText, accessToken }) {
   const tokens = recipients.map((participant) => participant.pushToken).filter(isExpoPushToken);
   if (tokens.length === 0) return [];
 
@@ -14,18 +14,18 @@ export async function pushRoomUpdate({ recipients, roomCode, text, replyText, ac
   const messages = tokens.flatMap((to) => [
     {
       to,
-      title: `Room ${roomCode}`,
+      title: roomName,
       body: notificationBody,
       sound: 'default',
       priority: 'high',
       channelId: 'messages',
-      data: { kind: 'room-open', roomCode },
+      data: { kind: 'room-open', roomCode, roomId },
     },
     {
       to,
       priority: 'high',
       _contentAvailable: true,
-      data: { kind: 'room-overlay', roomCode, text: notificationBody.slice(0, 500) },
+      data: { kind: 'room-overlay', roomCode, roomId, text: `${roomName}: ${notificationBody}`.slice(0, 500) },
     },
   ]);
 

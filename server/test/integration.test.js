@@ -26,7 +26,12 @@ test('two clients create, join, send a message, and close the room', async (cont
 
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  const creator = await fetch(`${baseUrl}/api/rooms`, { method: 'POST' }).then((response) => response.json());
+  const creator = await fetch(`${baseUrl}/api/rooms`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Socket Room' }),
+  }).then((response) => response.json());
+  assert.equal(creator.room.name, 'Socket Room');
   const joiner = await fetch(`${baseUrl}/api/rooms/join`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -46,6 +51,10 @@ test('two clients create, join, send a message, and close the room', async (cont
   const original = await receivedUpdate;
   assert.equal(original.text, 'sent only after pressing send');
 
+  const deliveredReceipt = once(first, 'message:receipt');
+  second.emit('message:delivered', { messageId: original.id });
+  assert.equal((await deliveredReceipt).status, 'delivered');
+
   const receivedReply = once(first, 'message:new');
   const replyAcknowledgement = new Promise((resolve) => {
     second.emit('message:send', { text: 'this is a reply', replyToId: original.id }, resolve);
@@ -56,6 +65,10 @@ test('two clients create, join, send a message, and close the room', async (cont
     text: original.text,
     authorId: original.authorId,
   });
+
+  const seenReceipt = once(first, 'message:receipt');
+  second.emit('messages:seen');
+  assert.equal((await seenReceipt).status, 'seen');
 
   const closed = once(second, 'session:closed');
   first.emit('session:logout', {}, () => undefined);

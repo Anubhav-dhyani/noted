@@ -27,7 +27,7 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
 
   app.post('/api/rooms', async (_request, response, next) => {
     try {
-      response.status(201).json(await store.createRoom());
+      response.status(201).json(await store.createRoom(_request.body?.name));
     } catch (error) {
       next(error);
     }
@@ -97,17 +97,54 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
 
     io.on('connection', async (socket) => {
       socket.join(socket.data.roomId);
+      const delivered = await store.markDelivered(socket.data.token);
+      if (delivered.messageIds.length) {
+        io.to(socket.data.roomId).emit('message:receipt', {
+          messageIds: delivered.messageIds,
+          status: 'delivered',
+        });
+      }
       const { room, participant } = await store.requireParticipant(socket.data.token);
       socket.emit('room:state', await store.publicRoom(room, participant.id));
       io.to(socket.data.roomId).emit('room:presence', { participantCount: room.participants.length });
 
       socket.on('presence:set', async ({ foreground } = {}) => {
         await store.setForeground(socket.data.token, foreground);
+        if (foreground) {
+          const seen = await store.markSeen(socket.data.token);
+          if (seen.messageIds.length) {
+            io.to(socket.data.roomId).emit('message:receipt', {
+              messageIds: seen.messageIds,
+              status: 'seen',
+            });
+          }
+        }
       });
 
-      socket.on('message:send', async ({ text, replyToId } = {}, acknowledge = () => {}) => {
+      socket.on('message:delivered', async ({ messageId } = {}) => {
+        if (typeof messageId !== 'string') return;
+        const deliveredResult = await store.markDelivered(socket.data.token, messageId);
+        if (deliveredResult.messageIds.length) {
+          io.to(socket.data.roomId).emit('message:receipt', {
+            messageIds: deliveredResult.messageIds,
+            status: 'delivered',
+          });
+        }
+      });
+
+      socket.on('messages:seen', async () => {
+        const seen = await store.markSeen(socket.data.token);
+        if (seen.messageIds.length) {
+          io.to(socket.data.roomId).emit('message:receipt', {
+            messageIds: seen.messageIds,
+            status: 'seen',
+          });
+        }
+      });
+
+      socket.on('message:send', async ({ text, replyToId, clientId } = {}, acknowledge = () => {}) => {
         try {
-          const result = await store.sendMessage(socket.data.token, text, replyToId);
+          const result = await store.sendMessage(socket.data.token, text, replyToId, clientId);
           io.to(socket.data.roomId).emit('message:new', result.message);
           acknowledge({ ok: true, message: result.message });
 
@@ -117,6 +154,8 @@ export function createApplication({ store, corsOrigin = '*', expoAccessToken = '
           pushRoomUpdate({
             recipients,
             roomCode: result.room.code,
+            roomId: result.room._id ?? result.room.id,
+            roomName: result.room.name ?? 'Private session',
             text: result.message.text,
             replyText: result.message.replyTo?.text,
             accessToken: expoAccessToken,
